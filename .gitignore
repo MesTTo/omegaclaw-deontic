@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+# install artifacts (only ever created inside a target clone, never here)
+.omegaclaw-deontic-receipt.json
+*.omegaclaw-deontic.bak
