@@ -1,174 +1,249 @@
 # omegaclaw-deontic
 
-A drop-in installer that adds a defeasible + deontic + temporal reasoning stack to
-a stock [OmegaClaw-Core](https://github.com/asi-alliance/OmegaClaw-Core) agent. It
-copies the deontic libraries into your clone and makes two small, reversible edits
-to register them, so the agent gains normative reasoning skills without you editing
-core files by hand. Everything it does is undone by `--uninstall`.
+omegaclaw-deontic gives an OmegaClaw agent a reasoning engine for two questions its
+belief engines (NAL and PLN) do not answer: what follows by default when rules
+conflict, and what is obligated, permitted, or forbidden. On top of that engine it
+adds a task orchestrator, so the agent can also plan and coordinate dependency-ordered
+work. Everything installs onto a stock OmegaClaw-Core clone and reverts cleanly.
 
-The same code is also available as the upstream PR series (deontic-core and its
-layers); this bundle packages it so anyone running OmegaClaw-Core can add it locally
-whether or not those PRs land.
+## Defaults and exceptions
 
-## What it adds
+A general rule can have a more specific exception that overrides it. The classic case
+is Tweety the penguin: birds normally fly, penguins are birds, but penguins normally
+do not fly, and the penguin rule is the more specific one.
 
-The full stack, in one install. Where OmegaClaw's NAL and PLN grade *how much* a
-fact is believed, this stack answers *what defeasibly holds* and *what is obligated,
-permitted, or forbidden*.
-
-| Layer | Files | Posture after a default install |
-|---|---|---|
-| Deontic engine | `lib_deontic.metta`, `src/deontic/**` | loaded; reasons via `dl-run` and friends |
-| Task orchestration | `lib_directive.metta`, `src/directive/**` | loaded; defeasible plans over task state |
-| Agent skills | `src/skills_deontic.metta` | loaded and advertised to the LLM |
-| NAL/PLN bridge | `src/integration/nal.metta` | loaded; called explicitly, no automatic hook |
-| Policy guardrail | `src/policy_guard.metta` | loaded but inert; opt in with `--enable-guardrail` |
-| Semantic retrieval | `src/integration/semantic.metta` | off by default; opt in with `--enable-semantic` |
-
-The engine runs on either of two interchangeable backends that yield identical
-conclusions: a first-argument-indexed Prolog kernel (`prolog`, the default) and an
-atomspace-native MeTTa engine (`native`). Select per run with `(dl-engine! native)`
-or `OMEGACLAW_DL_ENGINE`.
-
-## Requirements
-
-- A clone of OmegaClaw-Core running on [PeTTa](https://github.com/trueagi-io/PeTTa).
-- Python 3 (for the installer).
-- SWI-Prolog, which OmegaClaw-Core already needs. Verified here against 9.2.9.
-
-## Install (source clone)
-
-From the bundle directory:
-
+```metta
+(given bird) (given penguin)
+(normally r1 bird flies)
+(normally r2 penguin (not flies))
+(prefer r2 r1)                 ; when they collide, the penguin rule wins
 ```
+
+Run it:
+
+```metta
+!(import! &self (library OmegaClaw-Core lib_deontic))
+!(dl-run (dl-path examples/deontic/penguin.metta))
+; => ... (pd (lit neg none none flies ())) ... (nd (lit pos none none flies ())) ...
+```
+
+Read `(pd (lit neg none none flies ()))` as "defeasibly proven: not flies", and
+`(nd (lit pos none none flies ()))` as "defeasibly refuted: flies". Every conclusion
+carries a tag for how firmly it holds. `pD` and `nD` are definite, proven or refuted
+from facts and strict rules alone; `pd` and `nd` are defeasible, where a rule fired and
+every rule against it was beaten or outranked. Add a stronger fact later and a
+defeasible conclusion can be retracted, which is the whole point: conclusions a new
+fact can take back.
+
+Rules come in three strengths. A strict rule (`always`) holds whenever its body does. A
+defeasible rule (`normally`) holds unless something defeats it. A defeater (`except`)
+proves nothing on its own, it only blocks the opposite. `(prefer A B)` says rule A
+outranks rule B when the two collide.
+
+## Obligations, permissions, prohibitions
+
+The same engine reasons about norms. You write `(must p)` for an obligation,
+`(forbidden p)` for a prohibition, `(permitted p)`, and the engine knows that
+`forbidden p` is the same as `must (not p)`. While a request is unconfirmed, say,
+deleting it is forbidden and replying is required:
+
+```metta
+(given unconfirmed)
+(normally pr1 unconfirmed (forbidden delete))
+(normally pr2 unconfirmed (must reply))
+```
+
+`(dl-run-deontic <path>)` closes a theory under those operators, and
+`(deontic-compliance <path>)` tells you whether a course of action complies, violates,
+or leaves a duty open. Two harder cases are handled rather than ignored. A
+contrary-to-duty obligation is what becomes required once you have already broken a
+duty (you should not delete it, but if you did, you must now log the deletion); the
+engine compiles those reparation chains. And when two norms genuinely conflict with no
+way to rank them, it reports the dilemma instead of quietly picking a side:
+
+```metta
+(given a)
+(normally r1 a (must p))
+(normally r2 a (forbidden p))     ; O p and O not-p, nothing to break the tie
+```
+
+```metta
+!(deontic-dilemmas (dl-path examples/deontic/deontic_dilemma.metta))
+; => ((lit pos O none p ()))      the obligation on p is flagged as unresolved
+```
+
+## Reasoning over time
+
+Obligations and facts often hold only for a while. The engine includes an Event
+Calculus, where an event initiates or terminates a fluent and the fluent holds at a
+time if it was started before and not stopped since; the thirteen Allen relations
+between intervals (before, meets, overlaps, during, and the rest); and deadlines in two
+readings. An achievement deadline must be met by some time; a maintenance deadline must
+hold across an interval.
+
+```metta
+(deadline (must pay) achieve 0 30 fine)            ; pay by t=30, else the fine applies
+(deadline (forbidden trespass) maintain 0 100 penalty)
+(given (during pay 25 25))                          ; paid at t=25, in time
+```
+
+`(dl-run-at <path> <time>)` reasons as of a reference time, so you can ask what was
+obligated, met, or missed at any point.
+
+## Trust
+
+When facts come from sources of differing reliability, the engine carries a
+weakest-link trust value along each proof, so a conclusion is only as trustworthy as
+the least trustworthy fact it rests on. You give sources weights with `(trusts src v)`
+and gate conclusions with `(threshold n v)`.
+
+## It is also a task orchestrator
+
+The directive layer is where it stops being only a logic engine. It treats a plan of
+work as a defeasible theory: tasks are facts, and a readiness rule says a task becomes
+ready once its dependencies are done. The engine then derives what you can work on right
+now. Here is the core of a four-task plan where models and auth have no dependencies,
+crud waits on models, and tests waits on crud and auth (the full plan, with agents and
+assignment rules, is `tests/deontic/fixtures/basic-tasks.metta`):
+
+```metta
+(given task-auth) (given task-models) (given task-crud) (given task-tests)
+(given no-deps-auth) (given no-deps-models)
+(normally r-models (and task-models no-deps-models) ready-models)
+(normally r-auth   (and task-auth   no-deps-auth)   ready-auth)
+(normally r-crud   completed-models ready-crud)            ; crud needs models done first
+(normally r-tests  (and completed-crud completed-auth) ready-tests)
+```
+
+Ask what the state is, what to do next, and for a board view:
+
+```metta
+!(import! &self (library OmegaClaw-Core lib_directive))
+!(directive-status (dl-path plan.metta))
+; => (status (tasks (auth crud models tests)) (ready (auth models))
+;            (claimed ()) (blocked ()) (upstream-blocked ()) (completed ()))
+!(directive-next (dl-path plan.metta))
+; => (next-actions ((assign auth coder assign-to-auth-coder)
+;                   (assign auth reviewer assign-to-auth-reviewer)
+;                   (assign models coder assign-to-models-coder)))
+!(directive-board (dl-path plan.metta))
+; => (board (backlog (crud tests)) (ready (auth models)) (in-progress ()) (blocked ()) (done ()))
+```
+
+auth and models are ready because they have no open dependencies; crud and tests sit in
+the backlog until theirs clear. The lifecycle is part of the same logic.
+`(directive-claim plan task agent False)` and `(directive-complete plan task agent)`
+append a small block of facts and rules to the plan file, each outranking the last, so
+the most recent action wins and is still reversible, and completing a task's
+dependencies unlocks its dependents on the next run. Blocking propagates through the
+dependency graph: block one task and its descendants are marked `upstream-blocked`, so a
+disruption is visible downstream. Because every action is appended to the plan `.metta`
+file, the plan is its own durable, auditable history with no outside database, and a
+process-mining layer can read that history back as an event log and recover the rules
+from it.
+
+## The skills your agent gets
+
+After install the agent is told about these and calls each with a quoted path to a
+theory or plan file:
+
+- `deontic-conclude path` the defeasible conclusions of a theory.
+- `deontic-norms path` the conclusions under the deontic closure.
+- `deontic-conflicts path` the unresolved deontic dilemmas.
+- `directive-next path`, `directive-status path`, `directive-board path`, `directive-summary path` the orchestration views above.
+
+So a user can hand the agent a theory and ask a normative question, and the agent
+answers by running the engine, for example `(deontic-conclude "examples/deontic/penguin.metta")`.
+
+## Install
+
+You need a clone of OmegaClaw-Core running on [PeTTa](https://github.com/trueagi-io/PeTTa),
+Python 3, and SWI-Prolog (which OmegaClaw already needs; tested against 9.2.9). From this
+directory:
+
+```sh
 ./install.sh /path/to/PeTTa/repos/OmegaClaw-Core
 ```
 
-Useful flags (all pass through to `installer/install.py`, see `--help`):
+The installer copies the deontic files into the clone and makes two small, reversible
+edits to register them. `--uninstall` puts everything back, and `--dry-run` shows the
+plan first. For the prebuilt image, build the overlay and point the launcher at it:
 
-- `--dry-run` shows the plan and writes nothing.
-- `--enable-guardrail` routes the agent loop through the deontic guard (still inert until you supply a policy, see below).
-- `--enable-semantic` enables FAISS-based semantic retrieval; this pulls and builds `faiss_ffi`, so it needs network and a C/C++ toolchain.
-- `--skill-registry` refactor getSkills into an open catalogue so this and future plugins register skills without editing a shared list (see "The open skill registry" below).
-- `--minimal` skips `tests/` and `docs/` (used by the Docker build).
-- `--uninstall` reverts everything the install did.
-
-## Install (Docker)
-
-The prebuilt image bakes the clone at `/PeTTa/repos/OmegaClaw-Core`, so the plugin
-goes in as a build-time overlay. From the bundle root:
-
-```
+```sh
 docker build -f docker/Dockerfile -t omegaclaw-deontic:latest .
-```
-
-Then run it through the normal launcher by pointing `-d` at your image:
-
-```
 scripts/omegaclaw -d omegaclaw-deontic:latest start -t telegram ...
 ```
 
-Enable optional layers at build time with `--build-arg FLAGS="--enable-guardrail"`.
-The installer runs during the build, so the runtime security posture (dropping to
-`nobody`, tmpfs, scrubbed environment) is unchanged.
+## Two engines under the hood
 
-## Using it
+The same theory runs on either of two backends that give identical conclusions:
+`prolog`, a fast first-argument-indexed kernel that is the default, and `native`, an
+atomspace-native MeTTa engine where every rule and derived atom stays an inspectable
+atom. Switch per run with `(dl-engine! native)` or `OMEGACLAW_DL_ENGINE=native`. Native
+grounding (instantiating variable rules over data) runs a few times slower than the
+Prolog kernel, so prolog is the default for data-heavy theories while native is free on
+propositional plans and easier to inspect.
 
-After install the agent is told about these skills and calls them with a quoted path
-to a theory or plan file:
+## Options
 
-- `deontic-conclude path` defeasible conclusions of a theory, tagged `+D/-D` (definite) and `+d/-d` (defeasible).
-- `deontic-norms path` conclusions under the Standard Deontic Logic closure, where O, P, F interact and `F p = O not p`.
-- `deontic-conflicts path` unresolved deontic dilemmas, where `O p` and `O not p` are both applicable and neither is out-ranked.
-- `directive-next path` the actionable tasks in a plan right now.
-- `directive-status path`, `directive-board path`, `directive-summary path` task-state views of a plan.
+The semantic layer adds embedding-based retrieval over concluded facts, but it needs the
+`faiss_ffi` native build, so it is off unless you pass `--enable-semantic`.
 
-A theory or plan is an ordinary `.metta` file. The forms are `(given p)` for a fact,
-`(always L a b)` / `(normally L a b)` / `(except L a b)` for strict / defeasible /
-defeater rules, `(prefer L1 L2)` for superiority, and `(must p)` / `(forbidden p)` /
-`(permitted p)` for the deontic operators. See `examples/deontic/` and
-`docs/reference-lib-deontic.md` for the full surface, including temporal (Event
-Calculus, Allen relations, deadlines) and trust. The directive layer and its richer
-programmatic surface are documented in `docs/reference-lib-directive.md`.
+By default the installer advertises the deontic skills by splicing lines into
+OmegaClaw's `getSkills` list. Passing `--skill-registry` instead refactors that list
+into an open catalogue, `(= (getSkills) (collapse (skill-doc)))`, and registers each
+skill as its own `(= (skill-doc) "...")` equation, so you or any other module can add
+skills without editing a shared list. With nothing added it returns the original
+catalogue unchanged, and uninstall restores the file.
 
-## The guardrail (opt-in)
+The guardrail lets the agent check an action against a policy before it runs it. You
+write the policy as a deontic theory of what is forbidden and what is obligatory, like
+the one in `examples/deontic/policy.metta` that forbids deleting an unconfirmed item and
+requires replying to it. Pass `--enable-guardrail` to route the agent's actions through
+the policy, then turn it on by setting `(deonticGuardEnabled) True` and pointing
+`(policyPath)` at your policy. Until you do, it stays off and the agent runs exactly as
+before. Once on, a forbidden action is blocked before it happens. This governs what the
+agent ought to do, which is separate from the OS sandbox in `profile/policy.yaml` that
+limits what the process is allowed to do at all.
 
-`--enable-guardrail` makes the agent loop dispatch through `guarded-eval` instead of
-`eval`. That alone changes nothing: `deonticGuardEnabled` defaults to `False`, so
-`guarded-eval` is exactly `eval`. To actually govern actions, set
-`(deonticGuardEnabled) True` and point `(policyPath)` at a deontic policy theory (see
-`examples/deontic/policy.metta`). With a policy in force, an action the policy
-forbids is blocked before it runs. This is normative reasoning over what the agent
-*ought* to do, and is separate from the OS-level sandbox in `profile/policy.yaml`,
-which restricts what the process *can* do.
+## Under the sandbox
 
-## The open skill registry (opt-in)
-
-By default the installer advertises the deontic skills by splicing catalogue lines
-into OmegaClaw's `getSkills` list. That list is closed, so each addition edits a
-shared list. Passing `--skill-registry` instead refactors `getSkills` into an open
-catalogue,
-
-```metta
-(= (skill-doc) (superpose (;INTERNAL: ...core lines...)))
-(= (getSkills) (collapse (skill-doc)))
-```
-
-and registers each deontic skill as its own equation, for example
-
-```metta
-(= (skill-doc) "- Defeasible + deontic reasoning over a theory file: deontic-conclude path")
-```
-
-Now any module advertises a skill to the agent by adding a `(= (skill-doc) "...")`
-equation, with no edit to a shared list. With no equations added, `getSkills`
-returns the original catalogue byte-for-byte, so the change is backward compatible,
-and `--uninstall` restores the original `skills.metta`. This is the same change
-proposed upstream; the flag lets you adopt it locally whether or not it lands there.
-
-## Running under the sandbox
-
-The directive layer keeps plan state by appending claims blocks to the plan `.metta`
-file, so the plan file is its own durable, auditable state with no external store.
-Under the OpenShell filesystem policy (`profile/policy.yaml`), the directory holding
-your theory and plan files must be readable, and writable for any plan the agent
-edits. Place them under a permitted path or widen the policy accordingly.
+The directive layer writes its claim and completion blocks back into the plan `.metta`
+file, so under the OpenShell policy in `profile/policy.yaml` the directory holding your
+theories and plans has to be readable, and writable for any plan the agent edits. Put
+them under a permitted path or widen the policy.
 
 ## Uninstall
 
-```
+```sh
 ./install.sh /path/to/OmegaClaw-Core --uninstall
 ```
 
-This reads the install receipt (`.omegaclaw-deontic-receipt.json`), strips the two
-managed blocks, reverts the optional loop route, removes the copied files, and prunes
-the directories it created. The two patched core files return byte-for-byte to their
-pre-install state.
+This reads the install receipt, strips the two managed edits, removes the copied files,
+and restores the patched files byte-for-byte.
 
-## Compatibility
+## Compatibility and what's verified
 
-Tested against upstream OmegaClaw-Core at `origin/main` commit `519c342`. The
-installer does not assume a fixed file layout: it anchors the import block on the
-`lib_pln` import line and finds the `getSkills` splice point with a paren-balanced
-scan. If a future upstream moves either anchor, the install aborts with a clear
-message and writes nothing, rather than producing a half-patch.
+Tested against upstream OmegaClaw-Core at `origin/main` commit `519c342`. The installer
+finds its anchors by content rather than line number and aborts cleanly if upstream has
+moved them, so it never leaves a half-patch.
 
-## Verified
-
-- The deontic golden suite passes 10/10 (93 checks) under SWI-Prolog 9.2.9, run from a freshly installed clone.
-- Install is idempotent; `--uninstall` restores the patched files byte-for-byte and leaves the clone with a clean `git status`.
-- The optional `--skill-registry` mode refactors getSkills and registers the deontic skills as `(= (skill-doc) ...)` equations; verified under PeTTa that the installed getSkills renders the original catalogue plus the deontic and directive skills, with byte-exact uninstall.
-- The agent-facing skills run end to end from an installed clone, including the real `(deontic-conclude "path")` quoted-string convention, plus `deontic-norms` and `directive-status`.
-- The Docker overlay builds clean: a `docker build` pulls `singularitynet/omegaclaw:latest`, runs the installer in-image (31 functional files under `--minimal`, both core patches applied at `/PeTTa/repos/OmegaClaw-Core`), and produces `omegaclaw-deontic:latest`.
+The deontic golden suite passes 10 of 10 (93 checks) under SWI-Prolog 9.2.9 from a
+freshly installed clone. Install is idempotent, and `--uninstall` restores the patched
+files byte-for-byte with a clean `git status`. The agent skills run end to end from an
+installed clone, the `--skill-registry` mode renders the same catalogue plus the new
+skills, and the Docker overlay builds and installs in-image.
 
 ## Layout
 
 ```
-omegaclaw-deontic/
-  install.sh              wrapper around the installer
-  VERSION                 bundle version
-  installer/install.py    copy + managed-block patch + receipt + uninstall
-  payload/                the deontic files, mirroring the clone layout
-  docker/Dockerfile       build-time overlay on the stock image
-  README.md  DESIGN.md
+install.sh              wrapper around the installer
+installer/install.py    copy + reversible patch + receipt + uninstall
+payload/                the deontic files, mirroring the clone layout
+docker/Dockerfile       build-time overlay on the stock image
+payload/docs/deontic/   the engine's own overview and references
 ```
+
+More detail lives in `DESIGN.md` (how the installer works) and in
+`payload/docs/deontic/README.md` and `payload/docs/reference-lib-*.md` (the engine and
+directive APIs).
