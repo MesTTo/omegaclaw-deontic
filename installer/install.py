@@ -16,11 +16,16 @@ copied and patch applied, so uninstall reverts exactly what was done.
 Anchors are validated before anything is written: a missing anchor (upstream
 restructured the file) aborts the whole install rather than leaving a half-patch.
 
-Two managed-block shapes, because the two edits sit differently in their files:
-  import-block    full lines inserted at a line boundary (lib_omegaclaw.metta).
-  getskills-block inserted mid-structure, before the ')' that closes the
-                  getSkills tuple, so it owns a leading and trailing newline to
-                  keep that ')' on its own line and to revert byte-exactly.
+Skill advertising has two modes:
+  default          splice the deontic catalogue lines into the existing closed
+                   getSkills list (a managed block; minimal change to core).
+  --skill-registry apply the open-catalogue refactor: rewrite getSkills as
+                   (collapse (skill-doc)) and register each deontic skill as its
+                   own (= (skill-doc) "...") equation. With no equations added
+                   getSkills still returns the original catalogue byte-for-byte,
+                   and any other module can then advertise skills the same way
+                   without editing a shared list. Reverted by restoring the
+                   pristine skills.metta backup.
 """
 
 import argparse
@@ -39,9 +44,7 @@ BAK_SUFFIX = ".omegaclaw-deontic.bak"
 
 BEGIN = ";; >>> omegaclaw-deontic (managed; do not edit by hand) >>>"
 END = ";; <<< omegaclaw-deontic <<<"
-# Full inserted lines incl. trailing newline; revert leaves the line boundary intact.
 IMPORT_BLOCK_RE = re.compile(r"[ \t]*;; >>> omegaclaw-deontic.*?;; <<< omegaclaw-deontic <<<\n", re.DOTALL)
-# Leading + trailing newline are part of the span, so revert restores "X"))  exactly.
 GETSKILLS_BLOCK_RE = re.compile(r"\n[ \t]*;; >>> omegaclaw-deontic.*?;; <<< omegaclaw-deontic <<<\n", re.DOTALL)
 
 # Files whose import needs the faiss_ffi native build; off unless --enable-semantic.
@@ -57,14 +60,12 @@ LIBOMEGA_IMPORTS = [
     "!(import! &self (library OmegaClaw-Core src/policy_guard))",
     "!(import! &self (library OmegaClaw-Core src/integration/nal))",
 ]
-# Appended only with --enable-semantic, so enabling the layer is self-contained:
-# it pulls and builds faiss_ffi itself before importing the semantic module.
 SEMANTIC_IMPORTS = [
     '!(git-import! "https://github.com/patham9/faiss_ffi" "build.sh")',
     "!(import! &self (library OmegaClaw-Core src/integration/semantic))",
 ]
 
-# src/skills.metta: catalogue lines spliced into the getSkills tuple.
+# src/skills.metta: catalogue lines (the quoted strings) advertised to the LLM.
 SKILLS = "src/skills.metta"
 GETSKILLS_LINES = [
     '"- Defeasible + deontic reasoning over a theory file (tagged conclusions): deontic-conclude path"',
@@ -75,6 +76,19 @@ GETSKILLS_LINES = [
     '"- Kanban board view of a directive plan file: directive-board path"',
     '"- One-line progress summary of a directive plan file: directive-summary path"',
 ]
+
+# --skill-registry: the open-catalogue refactor. Anchored on the stock getSkills
+# head and tail; turns the closed list into an open (skill-doc) registry.
+SKILLS_OPEN_ANCHOR = "(= (getSkills)\n   (;INTERNAL:"
+SKILLS_OPEN_REPL = (
+    "; Open skill catalogue (added by omegaclaw-deontic --skill-registry). The core\n"
+    "; lines are the (skill-doc) equation below; any module advertises a skill by\n"
+    '; adding its own (= (skill-doc) "- what it does: skill-name arg") equation, and\n'
+    "; getSkills folds them all. With none added it returns the original catalogue.\n"
+    "(= (skill-doc)\n   (superpose (;INTERNAL:"
+)
+SKILLS_CLOSE_ANCHOR = '(stv 1.0 0.9)))"))'
+SKILLS_CLOSE_REPL = '(stv 1.0 0.9)))")))\n\n(= (getSkills) (collapse (skill-doc)))'
 
 # src/loop.metta: route skill dispatch through the guard (only --enable-guardrail).
 LOOP = "src/loop.metta"
@@ -101,7 +115,7 @@ def find_getskills_close(text):
     m = re.search(r"\(=\s*\(getSkills\)", text)
     if not m:
         return None
-    i = m.end()           # just past "(= (getSkills)"; we are at depth 1
+    i = m.end()
     depth = 1
     in_str = in_comment = False
     n = len(text)
@@ -130,9 +144,9 @@ def find_getskills_close(text):
         elif c == ")":
             depth -= 1
             if depth == 1:
-                return i      # closes the tuple (depth 2 -> 1)
+                return i
             if depth == 0:
-                return None   # equation closed before a tuple: unexpected shape
+                return None
             i += 1
         else:
             i += 1
@@ -164,7 +178,7 @@ def patch_libomega(text, enable_semantic):
     text = strip_import_block(text)
     imports = LIBOMEGA_IMPORTS + (SEMANTIC_IMPORTS if enable_semantic else [])
     idx = text.index(LIBOMEGA_ANCHOR)
-    eol = text.index("\n", idx) + 1           # start of the line after the anchor
+    eol = text.index("\n", idx) + 1
     return text[:eol] + import_block(imports) + text[eol:]
 
 
@@ -176,9 +190,21 @@ def patch_getskills(text):
     return text[:close] + getskills_block(GETSKILLS_LINES) + text[close:]
 
 
+def registry_transform(pristine):
+    """Open-catalogue refactor of a pristine skills.metta: rewrite getSkills as an
+    open (skill-doc) registry and register each deontic line as its own equation.
+    Returns None if the stock getSkills anchors are not present."""
+    if SKILLS_OPEN_ANCHOR not in pristine or SKILLS_CLOSE_ANCHOR not in pristine:
+        return None
+    t = pristine.replace(SKILLS_OPEN_ANCHOR, SKILLS_OPEN_REPL, 1)
+    t = t.replace(SKILLS_CLOSE_ANCHOR, SKILLS_CLOSE_REPL, 1)
+    eqs = "\n".join(f"(= (skill-doc) {s})" for s in GETSKILLS_LINES)
+    return f"{t}\n{BEGIN}\n{eqs}\n{END}\n"
+
+
 def patch_loop_enable(text):
     if LOOP_GUARDED in text:
-        return text          # already routed
+        return text
     if LOOP_PLAIN not in text:
         return None
     return text.replace(LOOP_PLAIN, LOOP_GUARDED, 1)
@@ -215,7 +241,14 @@ def backup(target, rel, receipt_backups):
         receipt_backups.append(rel + BAK_SUFFIX)
 
 
-def do_install(target, enable_semantic, enable_guardrail, minimal, force, dry):
+def pristine_skills_text(target):
+    """The pristine skills.metta: the backup if one exists (so re-runs transform
+    from the original), else the current file (the clean first install)."""
+    bak = target / (SKILLS + BAK_SUFFIX)
+    return (bak if bak.exists() else (target / SKILLS)).read_text()
+
+
+def do_install(target, enable_semantic, enable_guardrail, skill_registry, minimal, force, dry):
     if not (target / LIBOMEGA).exists() or not (target / SKILLS).exists():
         die(f"{target} does not look like an OmegaClaw-Core clone "
             f"(missing {LIBOMEGA} or {SKILLS}).")
@@ -230,8 +263,14 @@ def do_install(target, enable_semantic, enable_guardrail, minimal, force, dry):
     if patch_libomega(libomega_text, enable_semantic) is None:
         die(f"{LIBOMEGA}: import anchor not found:\n  {LIBOMEGA_ANCHOR}")
     skills_text = (target / SKILLS).read_text()
-    if patch_getskills(skills_text) is None:
-        die(f"{SKILLS}: could not locate the getSkills tuple to splice into.")
+    if skill_registry:
+        if registry_transform(pristine_skills_text(target)) is None:
+            die(f"{SKILLS}: getSkills anchors for the registry refactor not found.\n"
+                f"  Uninstall any prior omegaclaw-deontic install first, or upstream "
+                f"getSkills changed shape.")
+    else:
+        if patch_getskills(skills_text) is None:
+            die(f"{SKILLS}: could not locate the getSkills tuple to splice into.")
     loop_text = None
     if enable_guardrail:
         loop_text = (target / LOOP).read_text()
@@ -243,11 +282,12 @@ def do_install(target, enable_semantic, enable_guardrail, minimal, force, dry):
             die(f"refusing to overwrite existing file not from a prior install: {rel}\n"
                 f"  (re-run with --force to overwrite)")
 
+    advertise = "skill-doc registry" if skill_registry else "getSkills splice"
     print(f"omegaclaw-deontic {bundle_version()} -> {target}")
     print(f"  layers: core, directive, skill, nal, guardrail"
           f"{', semantic' if enable_semantic else ''}"
           f"{' (guard loop routing ON)' if enable_guardrail else ''}")
-    print(f"  copy {len(files)} files; patch {LIBOMEGA}, {SKILLS}"
+    print(f"  copy {len(files)} files; patch {LIBOMEGA}, {SKILLS} ({advertise})"
           f"{', ' + LOOP if enable_guardrail else ''}")
     if dry:
         print("  (dry run: nothing written)")
@@ -258,7 +298,7 @@ def do_install(target, enable_semantic, enable_guardrail, minimal, force, dry):
         "installed_at": datetime.now(timezone.utc).isoformat(),
         "target": str(target),
         "flags": {"semantic": enable_semantic, "guardrail": enable_guardrail,
-                  "minimal": minimal},
+                  "skill_registry": skill_registry, "minimal": minimal},
         "copied_files": [],
         "patched_files": [],
         "backups": [],
@@ -275,8 +315,12 @@ def do_install(target, enable_semantic, enable_guardrail, minimal, force, dry):
     receipt["patched_files"].append({"path": LIBOMEGA, "kind": "import-block"})
 
     backup(target, SKILLS, receipt["backups"])
-    (target / SKILLS).write_text(patch_getskills(skills_text))
-    receipt["patched_files"].append({"path": SKILLS, "kind": "getskills-block"})
+    if skill_registry:
+        (target / SKILLS).write_text(registry_transform(pristine_skills_text(target)))
+        receipt["patched_files"].append({"path": SKILLS, "kind": "skills-registry"})
+    else:
+        (target / SKILLS).write_text(patch_getskills(skills_text))
+        receipt["patched_files"].append({"path": SKILLS, "kind": "getskills-block"})
 
     if enable_guardrail:
         backup(target, LOOP, receipt["backups"])
@@ -313,6 +357,10 @@ def unpatch(target, entry):
         f.write_text(strip_import_block(f.read_text()))
     elif kind == "getskills-block":
         f.write_text(strip_getskills_block(f.read_text()))
+    elif kind == "skills-registry":
+        bak = target / (entry["path"] + BAK_SUFFIX)
+        if bak.exists():
+            f.write_text(bak.read_text())
 
 
 def do_uninstall(target, dry):
@@ -365,6 +413,9 @@ def main():
                     help="also enable the FAISS semantic layer (pulls + builds faiss_ffi)")
     ap.add_argument("--enable-guardrail", action="store_true",
                     help="route the agent loop through the deontic guard (inert until a policy is set)")
+    ap.add_argument("--skill-registry", action="store_true",
+                    help="refactor getSkills into an open (skill-doc) registry and register the "
+                         "deontic skills as separate equations (instead of splicing the list)")
     ap.add_argument("--minimal", action="store_true", help="skip tests/ and docs/ (for images)")
     ap.add_argument("--force", action="store_true", help="overwrite existing files")
     ap.add_argument("--dry-run", action="store_true", help="show the plan, write nothing")
@@ -380,7 +431,7 @@ def main():
         do_uninstall(target, args.dry_run)
     else:
         do_install(target, args.enable_semantic, args.enable_guardrail,
-                   args.minimal, args.force, args.dry_run)
+                   args.skill_registry, args.minimal, args.force, args.dry_run)
 
 
 if __name__ == "__main__":

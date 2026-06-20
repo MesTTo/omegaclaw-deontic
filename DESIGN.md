@@ -22,8 +22,10 @@ clone, or an upstream plugin-loader seam), this bundle takes the installer route
 works on a frozen upstream with no cooperation and no new core machinery, and it
 stays reversible. The trade is that it edits two core files in place rather than
 discovering the plugin at load time. A registry refactor of `getSkills` (fold over a
-`(skill-doc ...)` set) would make future plugins zero-edit, but that is a larger,
-opinionated core change and belongs upstream, not in a drop-in installer.
+`(skill-doc)` set) makes future plugins zero-edit. It was proposed upstream and not
+merged, so the installer offers it as the opt-in `--skill-registry` mode rather than
+forcing it: the default stays the minimal splice, and a user who wants the open
+catalogue chooses it. See below.
 
 ## Mechanism
 
@@ -74,6 +76,23 @@ default install is safe:
   (`directive-next/status/board/summary`) are single-argument and safe, so the bundle
   advertises them. The fuller lifecycle surface stays available programmatically.
 
+## The optional skill-doc registry
+
+`--skill-registry` applies the open-catalogue refactor instead of the splice. It
+rewrites the closed `getSkills` into
+
+```metta
+(= (skill-doc) (superpose (;INTERNAL: ...core lines...)))
+(= (getSkills) (collapse (skill-doc)))
+```
+
+so `getSkills` collects every `(skill-doc)` result, and registers each deontic skill
+as its own `(= (skill-doc) "...")` equation. `superpose`/`collapse` keep `getSkills`
+single-valued and, with no extra equations, byte-identical to the original (verified
+by rendering both under PeTTa). Because the refactor is structural rather than a
+managed block, uninstall reverts it by restoring the pristine `skills.metta` backup
+recorded in the receipt. The default install is unaffected; this is purely opt-in.
+
 ## Docker
 
 The prebuilt image bakes the clone at `/PeTTa/repos/OmegaClaw-Core`. The overlay runs
@@ -94,6 +113,9 @@ existing `-d` flag, so no launcher change is needed.
   penguin conclusion set under both the `dl-path` form and the real
   `(deontic-conclude "path")` quoted-string convention; `deontic-norms` returns the
   SDL closure; `directive-status` reads task-state groups.
+- `--skill-registry` mode: the installed `skills.metta` loads under PeTTa and
+  `getSkills` renders the original catalogue plus the deontic and directive skills;
+  idempotent re-run and byte-exact uninstall.
 - Docker overlay: builds clean against `singularitynet/omegaclaw:latest`. The
   installer runs during the build (clone at `/PeTTa/repos/OmegaClaw-Core`, 31 files
   under `--minimal`, both patches applied) and the image exports as

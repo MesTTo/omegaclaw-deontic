@@ -49,6 +49,7 @@ Useful flags (all pass through to `installer/install.py`, see `--help`):
 - `--dry-run` shows the plan and writes nothing.
 - `--enable-guardrail` routes the agent loop through the deontic guard (still inert until you supply a policy, see below).
 - `--enable-semantic` enables FAISS-based semantic retrieval; this pulls and builds `faiss_ffi`, so it needs network and a C/C++ toolchain.
+- `--skill-registry` refactor getSkills into an open catalogue so this and future plugins register skills without editing a shared list (see "The open skill registry" below).
 - `--minimal` skips `tests/` and `docs/` (used by the Docker build).
 - `--uninstall` reverts everything the install did.
 
@@ -101,6 +102,30 @@ forbids is blocked before it runs. This is normative reasoning over what the age
 *ought* to do, and is separate from the OS-level sandbox in `profile/policy.yaml`,
 which restricts what the process *can* do.
 
+## The open skill registry (opt-in)
+
+By default the installer advertises the deontic skills by splicing catalogue lines
+into OmegaClaw's `getSkills` list. That list is closed, so each addition edits a
+shared list. Passing `--skill-registry` instead refactors `getSkills` into an open
+catalogue,
+
+```metta
+(= (skill-doc) (superpose (;INTERNAL: ...core lines...)))
+(= (getSkills) (collapse (skill-doc)))
+```
+
+and registers each deontic skill as its own equation, for example
+
+```metta
+(= (skill-doc) "- Defeasible + deontic reasoning over a theory file: deontic-conclude path")
+```
+
+Now any module advertises a skill to the agent by adding a `(= (skill-doc) "...")`
+equation, with no edit to a shared list. With no equations added, `getSkills`
+returns the original catalogue byte-for-byte, so the change is backward compatible,
+and `--uninstall` restores the original `skills.metta`. This is the same change
+proposed upstream; the flag lets you adopt it locally whether or not it lands there.
+
 ## Running under the sandbox
 
 The directive layer keeps plan state by appending claims blocks to the plan `.metta`
@@ -132,6 +157,7 @@ message and writes nothing, rather than producing a half-patch.
 
 - The deontic golden suite passes 10/10 (93 checks) under SWI-Prolog 9.2.9, run from a freshly installed clone.
 - Install is idempotent; `--uninstall` restores the patched files byte-for-byte and leaves the clone with a clean `git status`.
+- The optional `--skill-registry` mode refactors getSkills and registers the deontic skills as `(= (skill-doc) ...)` equations; verified under PeTTa that the installed getSkills renders the original catalogue plus the deontic and directive skills, with byte-exact uninstall.
 - The agent-facing skills run end to end from an installed clone, including the real `(deontic-conclude "path")` quoted-string convention, plus `deontic-norms` and `directive-status`.
 - The Docker overlay builds clean: a `docker build` pulls `singularitynet/omegaclaw:latest`, runs the installer in-image (31 functional files under `--minimal`, both core patches applied at `/PeTTa/repos/OmegaClaw-Core`), and produces `omegaclaw-deontic:latest`.
 
